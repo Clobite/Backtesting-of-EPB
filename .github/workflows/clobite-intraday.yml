@@ -1,7 +1,5 @@
 name: CLOBITE 3min CSV
 on:
-  schedule:
-    - cron: '15 1 * * 1-5' # UTC: 한국시간 평일 10:15. 지연 실행 가능.
   workflow_dispatch:
     inputs:
       date:
