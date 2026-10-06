@@ -1,0 +1,53 @@
+name: CLOBITE 3min CSV
+on:
+  schedule:
+    - cron: '15 1 * * 1-5' # UTC: 한국시간 평일 10:15. 지연 실행 가능.
+  workflow_dispatch:
+    inputs:
+      date:
+        description: '거래일 YYYY-MM-DD (빈칸이면 오늘 KST)'
+        required: false
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: clobite-intraday
+  cancel-in-progress: false
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pandas numpy
+      - name: Collect
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          TARGET_DATE: ${{ inputs.date }}
+        run: |
+          if [ -n "$TARGET_DATE" ]; then
+            python CLOBITE_Backtest_Data.py --date "$TARGET_DATE"
+          else
+            python CLOBITE_Backtest_Data.py
+          fi
+      - name: Commit generated data
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add intraday/
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update CLOBITE intraday data'
+            git pull --rebase
+            git push
+          fi
+      - name: Diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clobite-collection-report
+          path: intraday/*_report.json
+          if-no-files-found: ignore
