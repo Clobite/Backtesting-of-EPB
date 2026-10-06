@@ -480,7 +480,7 @@ class KIS:
 
     def minutes(self, code, market, date):
         cursor = dt.datetime.combine(date, dt.time(9,59,59))
-        lower = dt.datetime.combine(date, dt.time(8))
+        lower = dt.datetime.combine(date, dt.time(9 if market == 'J' else 8))
         rows, seen = [], set()
         for page in range(30):
             data = self.get('/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice',
@@ -503,8 +503,9 @@ class KIS:
                     rows.append({**row, '_stamp': stamp})
                     added += 1
             oldest = min(stamps)
-            # 첫 봉의 거래대금 차분을 위해 08:00 직전 봉도 확보.
-            if oldest < lower:
+            # 시장 시작 봉 도달 시 종료: 시작 전 조회가 첫 봉으로 보정되는 응답 방지.
+            # 첫 봉 거래대금 기준이 없으면 TradingValue는 빈칸으로 유지.
+            if oldest <= lower:
                 return rows
             if not added or oldest >= cursor:
                 raise RuntimeError('분봉 페이지 진행 정체')
