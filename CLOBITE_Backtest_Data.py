@@ -424,20 +424,50 @@ class KIS:
                         'appkey': self.key, 'appsecret': self.secret,
                         'custtype': 'P'}
 
+    def safe_text(self, value):
+        text = str(value)
+        for secret in (self.key, self.secret, self.headers.get('authorization', '')):
+            if secret:
+                text = text.replace(secret, '[REDACTED]')
+        return text.replace('\n', ' ')[:500]
+
     def get(self, path, tr, params):
+        context = (f"TR={tr} market={params.get('FID_COND_MRKT_DIV_CODE')} "
+                   f"code={params.get('FID_INPUT_ISCD')} "
+                   f"date={params.get('FID_INPUT_DATE_1', '')} "
+                   f"time={params.get('FID_INPUT_HOUR_1', '')}")
+        last_error = 'UNKNOWN'
         for attempt in range(4):
-            time.sleep(0.15)  # 다른 작업과 동일 앱키 동시 실행은 피하세요.
+            time.sleep(0.15)
+            retryable = True
             try:
                 r = self.session.get(BASE_URL + path, params=params,
                     headers={**self.headers, 'tr_id': tr}, timeout=30)
-                r.raise_for_status()
+                if r.status_code != 200:
+                    retryable = r.status_code == 429 or r.status_code >= 500
+                    last_error = f'HTTP {r.status_code}'
+                    try:
+                        body = r.json()
+                        last_error += ' ' + self.safe_text(body.get('msg_cd', '')) + ' ' + self.safe_text(body.get('msg1', ''))
+                    except ValueError:
+                        pass
+                    raise RuntimeError(last_error)
                 data = r.json()
                 if str(data.get('rt_cd')) != '0':
-                    raise RuntimeError('KIS 응답 오류: ' + str(data.get('msg_cd', 'UNKNOWN')))
+                    msg_cd = str(data.get('msg_cd', 'UNKNOWN'))
+                    last_error = (f"rt_cd={data.get('rt_cd')} msg_cd={msg_cd} "
+                                  f"msg1={self.safe_text(data.get('msg1', ''))}")
+                    retryable = msg_cd in {'EGW00201', 'EGW00123'}
+                    raise RuntimeError(last_error)
                 return data
-            except (requests.RequestException, ValueError, RuntimeError):
-                if attempt == 3:
-                    raise RuntimeError(f'KIS 조회 실패: {tr}') from None
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                if isinstance(exc, requests.RequestException):
+                    last_error = type(exc).__name__  # 요청 헤더/키를 출력하지 않음
+                elif isinstance(exc, ValueError):
+                    last_error = '응답 JSON 해석 실패'
+                print(f'[API ERROR] {context} attempt={attempt+1}/4 {last_error}', flush=True)
+                if not retryable or attempt == 3:
+                    raise RuntimeError(f'{context}: {last_error}') from None
                 time.sleep(2 ** attempt)
 
     def daily(self, code, market, date):
@@ -464,10 +494,10 @@ class KIS:
             stamps = []
             added = 0
             for row in batch:
-                stamp = dt.datetime.strptime(row['stck_bsop_date'] + row['stck_cntg_hour'], '%Y%m%d%H%M%S')
+                stamp = dt.datetime.strptime(str(row['stck_bsop_date']) + str(row['stck_cntg_hour']).zfill(6), '%Y%m%d%H%M%S')
                 stamps.append(stamp)
                 if stamp > cursor:
-                    raise RuntimeError('API가 요청 시간 이후 분봉을 반환했습니다')
+                    raise RuntimeError(f'API 시간 경계 오류: 요청={cursor}, 반환={stamp}')
                 if stamp not in seen:
                     seen.add(stamp)
                     rows.append({**row, '_stamp': stamp})
@@ -498,16 +528,24 @@ def aggregate(rows, date):
     d['_minute'] = pd.to_datetime(d['_stamp']).dt.floor('min')
     if d['_minute'].duplicated().any():
         raise RuntimeError('동일 분에 여러 봉: 분봉 응답 규격 확인 필요')
+    start = pd.Timestamp(date).replace(hour=8)
+    # 수집 범위 밖 응답은 OHLC 검증에서 제외. 직전 1분은 거래대금 기준만 사용.
+    d = d[(d['_minute'] >= start-pd.Timedelta(minutes=1)) &
+          (d['_minute'] < start+pd.Timedelta(hours=2))].copy()
+    if d.empty:
+        return pd.DataFrame()
     for target, source in [('Open','stck_oprc'),('High','stck_hgpr'),
         ('Low','stck_lwpr'),('Close','stck_prpr'),('Volume','cntg_vol'),
         ('CumTradingValue','acml_tr_pbmn')]:
         d[target] = d[source].map(to_num) if source in d else np.nan
     if d[['Open','High','Low','Close','Volume']].isna().any().any():
-        raise RuntimeError('OHLCV 누락')
+        missing = [c for c in ['stck_oprc','stck_hgpr','stck_lwpr','stck_prpr','cntg_vol'] if c not in d or d[c].map(to_num).isna().any()]
+        raise RuntimeError(f'OHLCV 누락: {missing}; 응답 필드={list(d.columns)}')
     if ((d['High'] < d[['Open','Close','Low']].max(axis=1)) |
         (d['Low'] > d[['Open','Close','High']].min(axis=1)) |
         (d['Low'] <= 0) | (d['Volume'] < 0)).any():
-        raise RuntimeError('OHLCV 값 오류')
+        sample = d[['Open','High','Low','Close','Volume']].head(2).to_dict('records')
+        raise RuntimeError(f'OHLCV 값 오류: sample={sample}')
     delta = d['CumTradingValue'].diff()
     contiguous = d['_minute'].diff() == pd.Timedelta(minutes=1)
     d['TradingValue'] = delta.where(contiguous & (delta >= 0))
@@ -559,12 +597,17 @@ def main():
     universe = load_naver_cap_targets()
     frames, errors, reports = [], [], []
     collected = dt.datetime.now(KST).isoformat(timespec='seconds')
+    consecutive_errors = 0
+    tag = date.strftime('%Y%m%d')
     for i, target in universe.iterrows():
         code = str(target['Code'])
+        stage = 'KRX 전일종가'
         try:
             krx_close = prior_close(api.daily(code, 'J', date), prev_date)
+            stage = 'NXT 전일종가'
             nxt_close = prior_close(api.daily(code, 'NX', date), prev_date)
             for market, label in [('J','KRX'),('NX','NXT')]:
+                stage = f'{label} 분봉 조회/3분봉 집계'
                 bars = aggregate(api.minutes(code, market, date), date)
                 status = 'OK' if not bars.empty else 'NO_DATA_UNCONFIRMED'
                 reports.append({'Code':code,'TradingMarket':label,'Status':status,'Bars':len(bars)})
@@ -580,8 +623,17 @@ def main():
                     'CollectedAt':collected,'Source':'KIS','DataStatus':status}.items():
                     bars[key] = value
                 frames.append(bars)
+            consecutive_errors = 0
         except Exception as exc:
-            errors.append({'Code':code,'종목명':target['종목명'],'Error':str(exc)})
+            consecutive_errors += 1
+            error = {'Code':code,'종목명':target['종목명'],'Stage':stage,'Error':api.safe_text(exc)}
+            errors.append(error)
+            print(f'[ERROR] {code} {stage}: {error["Error"]}', flush=True)
+            atomic_write(out/f'KIS_3min_{tag}_report.json',
+                json.dumps({'Date':date.isoformat(),'Errors':errors,'Markets':reports,
+                            'Status':'COLLECTION_IN_PROGRESS_OR_ABORTED'},ensure_ascii=False,indent=2).encode('utf-8'))
+            if consecutive_errors >= 3:
+                raise RuntimeError('3종목 연속 실패: 조기 중단. 위 [ERROR]/[API ERROR] 및 report 확인') from None
         print(f'[{i+1}/{len(universe)}] {code}: errors={len(errors)}', flush=True)
     tag = date.strftime('%Y%m%d')
     metadata = {'Date':date.isoformat(),'PrevDate':prev_date,'UniverseCount':len(universe),
